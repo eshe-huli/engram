@@ -1,8 +1,8 @@
 # Engram — Architecture Document
 
-> **Version:** 2.0.0
+> **Version:** 2.1.0
 > **Date:** 2026-02-20
-> **Status:** Approved — Redesigned from first principles
+> **Status:** Approved — Scope-Native Clustering added
 > **Repository:** https://github.com/eshe-huli/engram
 
 ---
@@ -366,34 +366,160 @@ This is non-negotiable. A memory system that loses or corrupts data is worthless
 
 ---
 
-## Cluster Protocol
+## Cluster Protocol: Scope-Native Clustering
 
-### Replication: Raft-Based with Scope-Aware Sharding
+**Why not Raft:** Single leader bottleneck. Doesn't scale writes horizontally.
+**Why not Scylla's token ring:** Hash-based distribution scatters scope data across nodes. Breaks intelligence locality — consolidation, self-reflection, graph traversal all need the full scope locally.
+**Our approach:** Scope IS the shard. The semantic boundary that already exists in the data model IS the distribution unit.
+
+### Architecture
 
 ```
-┌────────────┐    ┌────────────┐    ┌────────────┐
-│  Node A    │    │  Node B    │    │  Node C    │
-│  (Leader)  │◄──►│ (Follower) │◄──►│ (Follower) │
-│            │    │            │    │            │
-│ Shard:     │    │ Shard:     │    │ Shard:     │
-│ fleet_001  │    │ fleet_001  │    │ fleet_002  │
-│ fleet_002  │    │ fleet_003  │    │ fleet_003  │
-└────────────┘    └────────────┘    └────────────┘
+┌─────────────────────────────────────────────────────┐
+│                  SCOPE MAP (gossip-propagated)       │
+│                                                      │
+│  fleet_001 → owner: Node_A, replicas: [Node_B]      │
+│  fleet_002 → owner: Node_B, replicas: [Node_A]      │
+│  fleet_003 → owner: Node_A, replicas: [Node_C]      │
+│  fleet_004 → owner: Node_C, replicas: [Node_B]      │
+│                                                      │
+│  Placement: balanced by memory count + write rate    │
+│  Hot scopes: 2-3 replicas. Cold scopes: 1 replica.  │
+└─────────────────────────────────────────────────────┘
+
+Node A (M4, 10 cores)              Node B (M3, 8 cores)
+┌──────────────────────┐          ┌──────────────────────┐
+│ OWNER: fleet_001     │──WAL──▶  │ REPLICA: fleet_001   │
+│   Core 0-2: squad_α  │ stream  │   WAL replay (async)  │
+│   Core 3-4: squad_β  │         │                       │
+│   Intelligence ⚡     │         │ OWNER: fleet_002      │
+│                      │ ◀──WAL──│   Core 0-3: squads    │
+│ OWNER: fleet_003     │ stream  │   Intelligence ⚡      │
+│ REPLICA: fleet_002   │         │ REPLICA: fleet_004    │
+└──────────────────────┘          └──────────────────────┘
 ```
 
-- **Shard key**: `(tenant_id, fleet_id)` — fleet data co-located
-- **Replication factor**: Configurable per tenant (default 2)
-- **Consensus**: Raft for leader election and WAL replication
-- **WAL replication**: Leader appends to WAL → replicates to followers → ack to client
-- **SST compaction**: Independent per node (deterministic, produces same output)
-- **Region pinning**: Shard placement tags, routing respects data sovereignty
-- **Rebalancing**: Shard migration = stream SST files + replay WAL delta
+### Scope Ownership Model
 
-### Discovery
+- **Scope = shard**: `(tenant_id, fleet_id)` is the distribution unit
+- **Owner**: Single node responsible for all writes to a scope. Runs intelligence locally.
+- **Replicas**: Receive WAL stream from owner. Serve reads (eventual consistency).
+- **Sub-sharding**: Within a scope, squads distribute across CPU cores on the owner (shard-per-core, inspired by ScyllaDB). Each core owns specific squads — zero cross-core locks.
 
-- **Gossip protocol** (SWIM-based) for membership
-- **DNS fallback** for bootstrap
-- **Shard map** propagated via gossip — every node knows where every shard lives
+### Write Path (Clustered)
+
+```
+Agent writes to fleet_001
+    │
+    ▼
+Any node receives request (coordinator)
+    │
+    ▼
+Scope map lookup: fleet_001 → owner: Node_A
+    │
+    ├── If this IS Node_A: local write (WAL → event log → memtable)
+    └── If this is NOT Node_A: forward to Node_A
+    │
+    ▼
+Node_A writes locally
+    │
+    ▼
+WAL entry streamed to replicas (configurable: async or semi-sync)
+    │
+    ├── Async: owner confirms immediately, replica catches up
+    └── Semi-sync: owner waits for 1 replica ack (for critical scopes)
+```
+
+### Read Path (Clustered)
+
+```
+Agent reads from fleet_001
+    │
+    ▼
+Consistency level?
+    │
+    ├── STRONG: route to owner (latest data guaranteed)
+    ├── EVENTUAL: route to any replica (faster, may be slightly stale)
+    └── LOCAL: route to nearest node that has the scope (lowest latency)
+```
+
+### Replication: WAL Streaming
+
+- Owner appends to WAL → streams entries to replicas in order
+- Replicas replay WAL entries into their own memtable + SST levels
+- **Lag tolerance**: Configurable per-scope (default: 5 seconds or 1000 entries)
+- If replica falls behind threshold → alert, consider adding replica or reducing load
+- Semi-sync mode available for critical scopes (owner waits for 1 replica ack)
+
+### Failure Handling
+
+```
+Node A dies (owns fleet_001, fleet_003)
+    │
+    ▼
+Gossip detects failure (phi-accrual, ~5 seconds)
+    │
+    ▼
+Scope map update:
+  fleet_001 → owner: Node_B (was replica, promoted)
+  fleet_003 → owner: Node_C (was replica, promoted)
+    │
+    ▼
+Promoted replicas start accepting writes
+(may have slight lag — last few WAL entries from dead owner lost if async)
+    │
+    ▼
+Node A recovers → rejoins as replica → re-syncs WAL delta
+```
+
+### Split-Brain Prevention
+
+- **Ownership leases**: Each scope owner holds a lease with TTL (renewed via gossip heartbeat)
+- **Partition rule**: If a node can't renew lease (isolated from majority), it stops accepting writes after TTL expires
+- **Reads continue**: Local stale reads still served (available for reads, consistent for writes)
+- **Partition heals**: Ownership reconfirmed, writes resume
+- **Consistency > availability** for writes during partitions — correct for a memory system where data integrity matters more than uptime
+
+### Scope Migration (Zero-Downtime Scaling)
+
+```
+Migrate fleet_003 from Node_A to Node_C:
+
+Phase 1: STREAMING
+  - Node_A continues owning fleet_003 (accepting writes)
+  - Node_A streams SST files + WAL to Node_C
+  - New writes during streaming are also forwarded to Node_C
+
+Phase 2: CATCHUP
+  - Node_C replays WAL, builds memtable + SST levels
+  - Node_C signals "caught up" to coordinator
+
+Phase 3: FLIP
+  - Scope map atomically updates: fleet_003 → owner: Node_C
+  - Node_A stops accepting writes for fleet_003
+  - Brief forwarding period: any in-flight writes to Node_A are forwarded to Node_C
+
+Phase 4: CLEANUP
+  - Node_A drops fleet_003 data (after confirmation)
+  - Node_C runs intelligence catchup (consolidation, reflection)
+```
+
+### Discovery & Membership
+
+- **Gossip protocol** (SWIM-based) for membership and scope map propagation
+- **Phi-accrual failure detector**: Probabilistic, adapts to network conditions
+- **Seed nodes**: Bootstrap list for initial cluster join
+- **DNS fallback**: SRV records for discovery in production deployments
+- **Scope map**: Every node has a full copy, propagated via gossip (small — just scope→node mappings)
+
+### Shard-Per-Core (Within Each Node)
+
+Inspired by ScyllaDB's killer optimization:
+- Each CPU core on a node owns specific scopes (or squads within large scopes)
+- Requests route directly to the owning core via lock-free queues
+- No cross-core coordination for reads or writes within a scope
+- M4 (10 cores) = 10 independent scope engines
+- M3 (8 cores) = 8 independent scope engines
 
 ### Embeddable Mode
 
@@ -402,7 +528,19 @@ Single-node, in-process. Same engine, no network layer. For:
 - Sidecar deployment (agent with local memory)
 - Edge devices
 
-Switch from embedded to cluster = configure peers + start replication. No data migration.
+Switch from embedded to cluster = configure seed peers + start replication. No data migration — existing scopes become owned by the single node, replicas added as peers join.
+
+### Self-Critique Log (Living Section)
+
+Architecture decisions are never final. This section tracks known weaknesses and planned improvements.
+
+| # | Weakness | Severity | Mitigation | Status |
+|---|----------|----------|------------|--------|
+| 1 | Single-writer-per-scope hotspot with 500+ concurrent agent writes | Medium | Squad-level sub-sharding across cores on owner node | Designed |
+| 2 | Async WAL replication can lose last few writes on owner crash | Medium | Semi-sync mode for critical scopes; configurable lag tolerance | Designed |
+| 3 | Scope migration Phase 3 flip has brief forwarding latency | Low | Acceptable — no data loss, ~100ms elevated latency | Accepted |
+| 4 | Split-brain sacrifices write availability | Low | Correct tradeoff for memory system — integrity > uptime | Accepted |
+| 5 | Gossip convergence time (~5s) means brief unavailability on failure | Low | Phi-accrual tunable; critical scopes can use faster heartbeat | Designed |
 
 ---
 
